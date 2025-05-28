@@ -207,7 +207,7 @@ class SineGen(nn.Module):
         #        std = self.sine_amp/3 -> max value ~ self.sine_amp
         #        for voiced regions is self.noise_std
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-        noise = noise_amp * torch.linspace(0.1, 0.9, sine_waves.shape[-1]).expand_as(sine_waves)
+        noise = noise_amp * torch.linspace(0.1, 0.9, sine_waves.shape[-1], device=noise_amp.device).expand_as(sine_waves)
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
         sine_waves = sine_waves * uv + noise

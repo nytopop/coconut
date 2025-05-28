@@ -37,7 +37,6 @@ class KModel(torch.nn.Module):
         config: Union[Dict, str, None] = None,
         model: Optional[str] = None,
         disable_complex: bool = False,
-        voice_name: Optional[str] = None
     ):
         super().__init__()
         if repo_id is None:
@@ -67,10 +66,6 @@ class KModel(torch.nn.Module):
             dim_in=config['hidden_dim'], style_dim=config['style_dim'],
             dim_out=config['n_mels'], disable_complex=disable_complex, **config['istftnet']
         )
-        if voice_name is None:
-            voice_name = "af_heart"
-        voice_path = f"./voices/{voice_name}.bin"
-        self.ref_s = self.load_bin_voice(voice_path).to(self.device)
     
         if not model:
             model = hf_hub_download(repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id])
@@ -83,30 +78,6 @@ class KModel(torch.nn.Module):
                 state_dict = {k[7:]: v for k, v in state_dict.items()}
                 getattr(self, key).load_state_dict(state_dict, strict=False)
 
-    def load_bin_voice(self, voice_path: str) -> torch.Tensor:
-        """
-        Load a .bin voice file as a PyTorch tensor.
-        
-        Args:
-            voice_path: Path to the .bin voice file
-            
-        Returns:
-            PyTorch tensor containing the voice data
-        """
-        if not os.path.exists(voice_path):
-            raise FileNotFoundError(f"Voice file not found: {voice_path}")
-        
-        if not voice_path.endswith('.bin'):
-            raise ValueError(f"Expected a .bin file, got: {voice_path}")
-        
-        # Load the binary file as a numpy array of float32 values
-        voice_data = np.fromfile(voice_path, dtype=np.float32).reshape(-1, 1, 256)
-        # Convert to PyTorch tensor
-        voice_tensor = torch.tensor(voice_data, dtype=torch.float32)
-        
-        # Return the tensor
-        return voice_tensor
-
     @property
     def device(self):
         return self.bert.device
@@ -115,15 +86,16 @@ class KModel(torch.nn.Module):
     class Output:
         audio: torch.FloatTensor
         pred_dur: Optional[torch.LongTensor] = None
-    
+
     @torch.no_grad()
     def forward_with_tokens(
         self,
-        input_ids: torch.LongTensor,
+        styles: torch.FloatTensor,       # B x 510 x 1 x 256
+        input_ids: torch.LongTensor,     # B x S
+        input_lengths: torch.LongTensor, # B
         speed: float,
-        input_lengths: Optional[torch.LongTensor]
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
-        ref_s = self.ref_s[input_lengths,:,:]
+        ref_s = styles[torch.arange(styles.shape[0]), input_lengths, :, :]
         s = ref_s[:, :, 128:] # b x 1 x sty_dim
     
         max_len = input_ids.shape[1]
@@ -151,7 +123,10 @@ class KModel(torch.nn.Module):
         frame_indices = torch.arange(max_frames, device=self.device).view(1,1,-1) # 1 x 1 x max_dur
         duration_cumsum = duration.cumsum(dim=1).unsqueeze(-1) # b x seq_len x 1
         mask1 = duration_cumsum > frame_indices # b x seq_len x max_dur
-        mask2 = frame_indices >= torch.cat([torch.zeros(duration.shape[0],1, 1), duration_cumsum[:,:-1,:]],dim=1) # b x seq_len x max_dur
+        mask2 = frame_indices >= torch.cat([
+            torch.zeros(duration.shape[0],1, 1, device=self.device),
+            duration_cumsum[:,:-1,:],
+        ], dim=1) # b x seq_len x max_dur
         pred_aln_trg = (mask1 & mask2).float().transpose(1, 2) # b x max_dur x seq_len 
         en = torch.bmm(pred_aln_trg, d) # b x max_dur x (d_model + sty_dim)
 
@@ -164,6 +139,7 @@ class KModel(torch.nn.Module):
         frame_lengths = updated_seq_lengths * (audio.shape[-1]//max_frames)
         return audio, frame_lengths.long()
 
+    # TODO: args here weren't correct from the start...
     def forward(
         self,
         phonemes: str,
