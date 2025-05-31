@@ -229,7 +229,6 @@ def main():
     os.makedirs(exp_dir, exist_ok=True)
     logging.info(f"Experiment dir: {exp_dir}")
 
-    # TODO: shouldn't we be using the population best, not the best?
     def save_checkpoint(i):
         best = s.status["pop_best"].access_values(keep_evals=True).unsqueeze(0).to(tts.device)
         best = i2v(best).squeeze(0)
