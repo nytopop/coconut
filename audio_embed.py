@@ -1,10 +1,15 @@
+import functools
+import struct
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 import librosa as lr
 import numpy as np
 import torch
+import webrtcvad
+from scipy.ndimage.morphology import binary_dilation
 from torch import nn
+from torchaudio.transforms import MelSpectrogram
 
 ## Mel-filterbank
 mel_window_length = 25  # In milliseconds
@@ -35,21 +40,6 @@ audio_norm_target_dBFS = -30
 model_hidden_size = 256
 model_embedding_size = 256
 model_num_layers = 3
-
-
-def wav_to_mel_spectrogram(wav):
-    """
-    Derives a mel spectrogram ready to be used by the encoder from a preprocessed audio waveform.
-    Note: this not a log-mel spectrogram.
-    """
-    frames = lr.feature.melspectrogram(
-        y=wav,
-        sr=sampling_rate,
-        n_fft=int(sampling_rate * mel_window_length / 1000),
-        hop_length=int(sampling_rate * mel_window_step / 1000),
-        n_mels=mel_n_channels,
-    )
-    return frames.astype(np.float32).T
 
 
 class VoiceEncoder(nn.Module):
@@ -86,6 +76,14 @@ class VoiceEncoder(nn.Module):
         self.load_state_dict(checkpoint["model_state"], strict=False)
         self.to(device)
 
+        msg = MelSpectrogram(
+            sample_rate=sampling_rate,
+            n_fft=int(sampling_rate * mel_window_length / 1000),
+            hop_length=int(sampling_rate * mel_window_step / 1000),
+            n_mels=mel_n_channels,
+        )
+        self.mel_spectrogram = msg.to(device)
+
     def forward(self, mels: torch.FloatTensor):
         """
         Computes the embeddings of a batch of utterance spectrograms.
@@ -102,6 +100,7 @@ class VoiceEncoder(nn.Module):
         return embeds_raw / torch.norm(embeds_raw, dim=1, keepdim=True)
 
     @staticmethod
+    @functools.cache
     def compute_partial_slices(n_samples: int, rate, min_coverage):
         """
         Computes where to split an utterance waveform and its corresponding mel spectrogram to
@@ -155,17 +154,14 @@ class VoiceEncoder(nn.Module):
 
         return wav_slices, mel_slices
 
-    def embed_utterance(self, wav: np.ndarray, return_partials=False, rate=1.3, min_coverage=0.75):
+    @torch.no_grad()
+    def embed(self, wavs: List[torch.FloatTensor], rate=1.3, min_coverage=0.75) -> torch.FloatTensor:
         """
-        Computes an embedding for a single utterance. The utterance is divided in partial
-        utterances and an embedding is computed for each. The complete utterance embedding is the
-        L2-normed average embedding of the partial utterances.
+        Computes an embedding for a batch of utterances. Each utterance is divided to partial slices
+        and an embedding is computed for each. The complete embedding for each utterance is the l2 norm
+        of the average embedding of all partials.
 
-        TODO: independent batched version of this function
-
-        :param wav: a preprocessed utterance waveform as a numpy array of float32
-        :param return_partials: if True, the partial embeddings will also be returned along with
-        the wav slices corresponding to each partial utterance.
+        :param wavs: preprocessed utterance waveforms as a list of torch tensors
         :param rate: how many partial utterances should occur per second. Partial utterances must
         cover the span of the entire utterance, thus the rate should not be lower than the inverse
         of the duration of a partial utterance. By default, partial utterances are 1.6s long and
@@ -175,43 +171,119 @@ class VoiceEncoder(nn.Module):
         then the last partial utterance will be considered by zero-padding the audio. Otherwise,
         it will be discarded. If there aren't enough frames for one partial utterance,
         this parameter is ignored so that the function always returns at least one slice.
-        :return: the embedding as a numpy array of float32 of shape (model_embedding_size,). If
-        <return_partials> is True, the partial utterances as a numpy array of float32 of shape
-        (n_partials, model_embedding_size) and the wav partials as a list of slices will also be
-        returned.
+        :return: the embedding as a B x N torch tensor where N is the model_embedding_size.
         """
-        # Compute where to split the utterance into partials and pad the waveform with zeros if
-        # the partial utterances cover a larger range.
-        wav_slices, mel_slices = self.compute_partial_slices(len(wav), rate, min_coverage)
-        max_wave_length = wav_slices[-1].stop
-        if max_wave_length >= len(wav):
-            wav = np.pad(wav, (0, max_wave_length - len(wav)), "constant")
+        mels, nmel = [], []
 
-        # Split the utterance into partials and forward them through the model
-        mel = wav_to_mel_spectrogram(wav)
-        mels = np.array([mel[s] for s in mel_slices])
-        with torch.no_grad():
-            mels = torch.from_numpy(mels).to(self.device)
-            partial_embeds = self(mels).cpu().numpy()
+        # compute mel spectrograms of partial slices of the input wavs
+        for wav in wavs:
+            wav = wav.to(self.device)
 
-        # Compute the utterance embedding from the partial embeddings
-        raw_embed = np.mean(partial_embeds, axis=0)
-        embed = raw_embed / np.linalg.norm(raw_embed, 2)
+            _wav, mel_slices = self.compute_partial_slices(len(wav), rate, min_coverage)
+            nmel.append(len(mel_slices))
 
-        if return_partials:
-            return embed, partial_embeds, wav_slices
-        return embed
+            if _wav[-1].stop >= len(wav):
+                wav = torch.nn.functional.pad(wav, (0, _wav[-1].stop - len(wav)))
 
-    def embed_speaker(self, wavs: List[np.ndarray], **kwargs):
-        """
-        Compute the embedding of a collection of wavs (presumably from the same speaker) by
-        averaging their embedding and L2-normalizing it.
+            mel = self.mel_spectrogram(wav).transpose(1, 0)
+            mels.extend([mel[s] for s in mel_slices])
 
-        :param wavs: list of wavs a numpy arrays of float32.
-        :param kwargs: extra arguments to embed_utterance()
-        :return: the embedding as a numpy array of float32 of shape (model_embedding_size,).
-        """
-        raw_embed = np.mean(
-            [self.embed_utterance(wav, return_partials=False, **kwargs) for wav in wavs], axis=0
+        # run mels through the pretrained model to get partial embeddings of each mel slice
+        partial_embeds = self(torch.stack(mels))
+
+        # compute the mean of partial embeddings belonging to each input wav
+        lens = torch.cumsum(torch.tensor([0] + nmel), dim=0)
+        sums = torch.stack([torch.sum(partial_embeds[a:b], axis=0) for a, b in zip(lens, lens[1:])])
+        mean = sums / torch.tensor(nmel, dtype=torch.float, device=self.device).unsqueeze(1)
+
+        # L2 norm
+        norm = mean / torch.linalg.vector_norm(mean, dim=1).unsqueeze(1)
+
+        return norm
+
+
+def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray], source_sr: Optional[int] = None):
+    """
+    Applies preprocessing operations to a waveform either on disk or in memory such that
+    The waveform will be resampled to match the data hyperparameters.
+
+    :param fpath_or_wav: either a filepath to an audio file (many extensions are supported, not
+    just .wav), either the waveform as a numpy array of floats.
+    :param source_sr: if passing an audio waveform, the sampling rate of the waveform before
+    preprocessing. After preprocessing, the waveform'speaker sampling rate will match the data
+    hyperparameters. If passing a filepath, the sampling rate will be automatically detected and
+    this argument will be ignored.
+    """
+    # Load the wav from disk if needed
+    if isinstance(fpath_or_wav, str) or isinstance(fpath_or_wav, Path):
+        wav, source_sr = lr.load(str(fpath_or_wav), sr=None)
+    else:
+        wav = fpath_or_wav
+
+    # Resample the wav
+    if source_sr is not None:
+        wav = lr.resample(wav, orig_sr=source_sr, target_sr=sampling_rate)
+
+    # Apply the preprocessing: normalize volume and shorten long silences
+    wav = normalize_volume(wav, audio_norm_target_dBFS, increase_only=True)
+    wav = trim_long_silences(wav)
+
+    return wav
+
+
+int16_max = (2**15) - 1
+
+
+def normalize_volume(wav, target_dBFS, increase_only=False, decrease_only=False):
+    if increase_only and decrease_only:
+        raise ValueError("Both increase only and decrease only are set")
+    rms = np.sqrt(np.mean((wav * int16_max) ** 2))
+    wave_dBFS = 20 * np.log10(rms / int16_max)
+    dBFS_change = target_dBFS - wave_dBFS
+    if dBFS_change < 0 and increase_only or dBFS_change > 0 and decrease_only:
+        return wav
+    return wav * (10 ** (dBFS_change / 20))
+
+
+def trim_long_silences(wav):
+    """
+    Ensures that segments without voice in the waveform remain no longer than a
+    threshold determined by the VAD parameters in params.py.
+
+    :param wav: the raw waveform as a numpy array of floats
+    :return: the same waveform with silences trimmed away (length <= original wav length)
+    """
+    # Compute the voice detection window size
+    samples_per_window = (vad_window_length * sampling_rate) // 1000
+
+    # Trim the end of the audio to have a multiple of the window size
+    wav = wav[: len(wav) - (len(wav) % samples_per_window)]
+
+    # Convert the float waveform to 16-bit mono PCM
+    pcm_wave = struct.pack("%dh" % len(wav), *(np.round(wav * int16_max)).astype(np.int16))
+
+    # Perform voice activation detection
+    voice_flags = []
+    vad = webrtcvad.Vad(mode=3)
+    for window_start in range(0, len(wav), samples_per_window):
+        window_end = window_start + samples_per_window
+        voice_flags.append(
+            vad.is_speech(pcm_wave[window_start * 2 : window_end * 2], sample_rate=sampling_rate)
         )
-        return raw_embed / np.linalg.norm(raw_embed, 2)
+    voice_flags = np.array(voice_flags)
+
+    # Smooth the voice detection with a moving average
+    def moving_average(array, width):
+        array_padded = np.concatenate((np.zeros((width - 1) // 2), array, np.zeros(width // 2)))
+        ret = np.cumsum(array_padded, dtype=float)
+        ret[width:] = ret[width:] - ret[:-width]
+        return ret[width - 1 :] / width
+
+    audio_mask = moving_average(voice_flags, vad_moving_average_width)
+    audio_mask = np.round(audio_mask).astype(bool)
+
+    # Dilate the voiced regions
+    audio_mask = binary_dilation(audio_mask, np.ones(vad_max_silence_length + 1))
+    audio_mask = np.repeat(audio_mask, samples_per_window)
+
+    return wav[audio_mask == True]
