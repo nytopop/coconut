@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
 from torch import nn
+from torch.nn.utils import rnn
 from transformers import AlbertConfig
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List
 import json
 import torch
 import os
@@ -82,6 +83,10 @@ class KModel(torch.nn.Module):
     def device(self):
         return self.bert.device
 
+    @property
+    def dtype(self):
+        return self.bert.dtype
+
     @dataclass
     class Output:
         audio: torch.FloatTensor
@@ -100,9 +105,9 @@ class KModel(torch.nn.Module):
     
         max_len = input_ids.shape[1]
         text_mask = torch.arange(max_len, device=self.device).unsqueeze(0)
-        sequence_mask = (text_mask.expand(input_ids.shape[0], -1) >= input_lengths.unsqueeze(1)).to(self.device) # b x seq_len
+        sequence_mask = (text_mask.expand(input_ids.shape[0], -1) >= input_lengths.unsqueeze(1)) # b x seq_len
         # Convert to attention mask where 1 means "attend to this token" and 0 means "ignore this token"
-        attention_mask = (~sequence_mask).float()
+        attention_mask = (~sequence_mask).to(dtype=self.dtype)
         
         # Forward pass through BERT
         bert_dur = self.bert(input_ids, attention_mask=attention_mask) # b x seq_len x hidden
@@ -127,36 +132,38 @@ class KModel(torch.nn.Module):
             torch.zeros(duration.shape[0],1, 1, device=self.device),
             duration_cumsum[:,:-1,:],
         ], dim=1) # b x seq_len x max_dur
-        pred_aln_trg = (mask1 & mask2).float().transpose(1, 2) # b x max_dur x seq_len 
+        pred_aln_trg = (mask1 & mask2).to(dtype=self.dtype).transpose(1, 2) # b x max_dur x seq_len
         en = torch.bmm(pred_aln_trg, d) # b x max_dur x (d_model + sty_dim)
 
         updated_frame_mask = (frame_indices.squeeze(1).expand(en.shape[0], -1) >= updated_seq_lengths.unsqueeze(1)).to(self.device)
-        updated_frame_mask = (~updated_frame_mask).float()
+        updated_frame_mask = (~updated_frame_mask).to(dtype=self.dtype)
         F0_pred, N_pred, _ = self.predictor.F0Ntrain(en, s, updated_seq_lengths, updated_frame_mask) # b x 1 x 2*max_dur, b x 1 x 2*max_dur
         t_en = self.text_encoder(input_ids, input_lengths, attention_mask) # b x seq_len x d_model
         asr = torch.bmm(pred_aln_trg, t_en) * updated_frame_mask.unsqueeze(-1) # b x max_dur x d_model
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :, :128], updated_frame_mask) # b x T
-        frame_lengths = updated_seq_lengths * (audio.shape[-1]//max_frames)
-        return audio, frame_lengths.long()
+        audio = audio.squeeze(1).float()
 
-    # TODO: args here weren't correct from the start...
+        frame_lengths = updated_seq_lengths * (audio.shape[-1]//max_frames)
+        return audiof, frame_lengths.long()
+
     def forward(
         self,
-        phonemes: str,
-        ref_s: torch.FloatTensor,
+        styles: torch.FloatTensor, # B x 510 x 1 x 256
+        phonemes: List[str],       # B
         speed: float = 1,
-        return_output: bool = False
-    ) -> Union['KModel.Output', torch.FloatTensor]:
-        input_ids = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), phonemes)))
-        logger.debug(f"phonemes: {phonemes} -> input_ids: {input_ids}")
-        assert len(input_ids)+2 <= self.context_length, (len(input_ids)+2, self.context_length)
-        input_ids = torch.LongTensor([[0, *input_ids, 0]]).to(self.device)
-        ref_s = ref_s.to(self.device)
-        audio, pred_dur = self.forward_with_tokens(input_ids, ref_s, speed)
-        audio = audio.squeeze().cpu()
-        pred_dur = pred_dur.cpu() if pred_dur is not None else None
-        logger.debug(f"pred_dur: {pred_dur}")
-        return self.Output(audio=audio, pred_dur=pred_dur) if return_output else audio
+    ) -> tuple[torch.FloatTensor, torch.LongTensor]:
+        styles = styles.to(dtype=self.dtype, device=self.device)
+
+        def tokenize(phonemes: str) -> torch.LongTensor:
+            toks = list(filter(lambda i: i is not None, map(lambda p: self.vocab.get(p), phonemes)))
+            assert len(toks)+2 <= self.context_length, (len(toks)+2, self.context_length)
+            return torch.tensor([0, *toks, 0], dtype=torch.long)
+
+        toks = [tokenize(item) for item in phonemes]
+        lens = torch.tensor([t.shape[0] for t in toks], dtype=torch.long).to(self.device)
+        toks = rnn.pad_sequence(toks, batch_first=True).to(self.device)
+
+        return self.forward_with_tokens(styles, toks, lens, speed=speed)
 
 class KModelForONNX(torch.nn.Module):
     def __init__(self, kmodel: KModel):
