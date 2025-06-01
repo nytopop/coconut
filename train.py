@@ -169,15 +169,15 @@ def main():
             with torch.autocast(tts.device.type):
                 syn_wavs, syn_lens = tts.forward_batch(styles, phonemes * n, speed=1)
 
-                pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+            pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
 
-                resm = 1e-2 * resemblyzer_loss(venc, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+            resm = 1e-2 * resemblyzer_loss(venc, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+
+            loss = pool + temp + resm
 
             if args.interp:
                 # TODO: add a regularization term of distance to nearest in pack
                 pass
-
-            loss = pool + temp + resm
 
             if args.spectral:
                 loss += spectral_loss(ref_wavs, syn_wavs, n)
