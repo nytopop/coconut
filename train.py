@@ -13,14 +13,16 @@ import soundfile as sf
 import torch
 from datasets import load_dataset
 from evotorch import Problem
-from evotorch.algorithms import CMAES, SNES, XNES, CEM
+from evotorch.algorithms import CEM, CMAES, SNES, XNES
 from evotorch.decorators import vectorized
 from evotorch.logging import PandasLogger
 from kokoro import KModel
 from misaki import en, espeak
-from torchaudio.functional import resample
+from torch.nn.utils.rnn import pad_sequence
+from transformers import MimiModel
 
-from audio_embed import VoiceEncoder, preprocess_wav
+from audio_embed import preprocess_wav
+from loss import mimi_loss, spectral_loss
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,9 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("--out-dir", default="out", metavar="DIR", help="output directory" + d)
     parser.add_argument("--suffix", help="suffix to append to output path" + d)
-    parser.add_argument("--save-every", type=int, default=20, metavar="N", help="save every N iterations" + d)
-    # TODO: save optimizer state so we can do warm resume (with stuff like covariance matrix prepared)
-    # parser.add_argument("--resume", metavar="PATH", help="resume from a saved checkpoint" + d)
+    parser.add_argument("--save-every", type=int, default=10, metavar="N", help="save every N iterations" + d)
     parser.add_argument("--seed", type=int, default=42, help="RNG seed" + d)
     parser.add_argument("-t", default="fp16", choices=["fp32", "fp16", "bf16"], help=d)
     parser.add_argument("-d", default="cuda", choices=["cpu", "cuda"], help=d)
@@ -58,16 +58,15 @@ def main():
     hd.add_argument("--no-stream", default=False, action="store_true", help="download dataset" + d)
 
     ho = parser.add_argument_group("objectives (choose one)")
-    ho.add_argument("--blend", metavar="DIR", help="linear combination of all voices in DIR")
-    ho.add_argument("--bias", metavar="PATH", help="style + ∧(bias) for style in voicepack")
-    ho.add_argument("--bias-mean", metavar="PATH", help="μ(voicepack) + ∧(bias) ")
-
+    ho.add_argument("--interp", metavar="DIR", help="fit a linear combination of all voices in DIR")
+    ho.add_argument("--bias", default=False, action="store_true", help="fit a free bias term" + d)
     args = parser.parse_args()
 
-    venc = VoiceEncoder(device=args.d)
+    if args.interp is None and not args.bias:
+        parser.error("at least one objective is required: --interp, --bias")
 
-    if [args.blend, args.bias, args.bias_mean].count(None) != 2:
-        parser.error("exactly one objective is required: --blend, --bias, --bias-mean")
+    # mimi for calculating perceptual loss
+    mimi = MimiModel.from_pretrained("kyutai/mimi").to(args.d)
 
     # configure & load kokoro
     try:
@@ -125,38 +124,31 @@ def main():
         num_workers=4,
         collate_fn=lambda rows: {
             "audio": [row["audio"] for row in rows],
-            "phonemes": [g2p(row["transcription"])[0] for row in rows],
+            "phonemes": [g2p(row["transcription"])[0][:508] for row in rows],
         },
     )
 
     # configure objective function
-    objective = "blend" if args.blend else "bias" if args.bias else "bias-mean"
+    if args.interp:
+        pack = [torch.load(f"{args.interp}/{p}", map_location=args.d) for p in os.listdir(args.interp)]
+        n, pack = len(pack), torch.stack(pack)  # => [N, 510, 1, 256]
+    else:
+        n = 0
 
-    match objective:
-        case "blend":
-            vpacks = [torch.load(f"{args.blend}/{p}", map_location=args.d) for p in os.listdir(args.blend)]
-            vpacks = torch.stack(vpacks)  # => [N, 510, 1, 256]
-            n = vpacks.shape[0]
-            bounds = (-1 / n, 1 / n)
+    init = torch.zeros(n + 256 if args.bias else n)
 
-            def i2v(pop: torch.Tensor) -> torch.Tensor:
-                weights = torch.softmax(pop[..., None, None, None], dim=1)
-                return (vpacks * weights).sum(dim=1)
-        case "bias":
-            vpack = torch.load(args.bias, map_location=args.d)  # => [510, 1, 256]
-            n, bounds = 256, (-args.sigma, args.sigma)
+    def i2v(pop: torch.Tensor) -> torch.Tensor:
+        scaled = biased = 0
 
-            def i2v(pop: torch.Tensor) -> torch.Tensor:
-                bias = pop[:, None, None, :].expand(-1, 510, -1, -1)
-                return bias + vpack
-        case "bias-mean":
-            vpack = torch.load(args.bias_mean, map_location=args.d)  # => [510, 1, 256]
-            voice = torch.mean(vpack, dim=0)  # => [1, 256]
-            n, bounds = 256, (-args.sigma, args.sigma)
+        if args.interp:
+            weight = torch.softmax(pop[:, :n][..., None, None, None], dim=1)
+            scaled = (pack * weight).sum(dim=1)
 
-            def i2v(pop: torch.Tensor) -> torch.Tensor:
-                biased = (pop.unsqueeze(1) + voice).unsqueeze(1)
-                return biased.expand(-1, 510, -1, -1)
+        # TODO: interpolate the final bias from a stack of equidistant buckets
+        if args.bias:
+            biased = pop[:, n:][:, None, None, :].expand(-1, 510, -1, -1)
+
+        return scaled + biased
 
     @vectorized
     def loss(pop: torch.Tensor) -> torch.Tensor:
@@ -167,67 +159,64 @@ def main():
         for styles in [styles[i : i + N] for i in range(0, styles.shape[0], N)]:
             n = styles.shape[0]
 
-            # prepare batch data for tts
             styles = styles.repeat_interleave(len(phonemes), 0)  # => [C, 510, 1, 256]
 
-            # generate audio + resample + trim lengths
-            outs, durs = tts.forward_batch(styles, phonemes * n, speed=1.0)
-            outs = resample(outs, orig_freq=24000, new_freq=16000)
-            trimmed = [outs[i, : int(durs[i] / 1.5)] for i in range(0, outs.shape[0])]
+            syn_wavs, syn_lens = tts.forward_batch(styles, phonemes * n, speed=1)
 
-            # compute embeddings
-            all_embeds = venc.embed(trimmed).reshape(n, len(phonemes), 256)  # => [N, B, 256]
-            M = torch.tensor([len(phonemes)] * n, device=venc.device).unsqueeze(1)
-            mean = torch.sum(all_embeds, dim=1) / M
-            embs = mean / torch.linalg.vector_norm(mean, dim=1).unsqueeze(1)
+            pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+            spec = spectral_loss(ref_wavs, syn_wavs, n)
+            loss = pool + temp + spec
 
-            # and loss is just sum of squared error
-            loss = torch.sum(torch.square(embs - target_embed.unsqueeze(0)), dim=1)
-            pop_loss.append(loss)
+            pop_loss.append(1e2 * loss)
 
         pop_loss = torch.cat(pop_loss)
 
         return torch.nan_to_num(pop_loss, nan=math.inf)
 
     # configure optimizer & search algorithm (TODO: could do device=args.d, but do we need to? uses vram)
-    p = Problem("min", loss, solution_length=n, initial_bounds=bounds, seed=args.seed)
+    p = Problem(
+        "min", loss, solution_length=init.shape[0], initial_bounds=(-args.sigma, args.sigma), seed=args.seed
+    )
 
     match args.alg:
         case "xnes":
-            s = XNES(p, stdev_init=args.sigma, popsize=args.pop)
+            s = XNES(p, stdev_init=args.sigma, popsize=args.pop, center_init=init)
         case "snes":
-            s = SNES(p, stdev_init=args.sigma, popsize=args.pop)
+            s = SNES(p, stdev_init=args.sigma, popsize=args.pop, center_init=init)
         case "cmaes":
-            s = CMAES(p, stdev_init=args.sigma, popsize=args.pop)
+            s = CMAES(p, stdev_init=args.sigma, popsize=args.pop, center_init=init)
         case "cem":
             if args.pop is None:
                 args.pop = 4 + 3 * math.log(n)
-            s = CEM(p, stdev_init=args.sigma, popsize=args.pop, parenthood_ratio=args.rho)
+            s = CEM(p, stdev_init=args.sigma, popsize=args.pop, parenthood_ratio=args.rho, center_init=init)
 
     pop = getattr(s, "_popsize", None)
     if pop is None:
         pop = getattr(s, "popsize", None)
 
+    objective = "joint" if args.interp and args.bias else "interp" if args.interp else "bias"
+
     title = (
         f"dataset={args.dataset} speaker={args.speaker}"
         + (f" style={args.style}" if args.style else "")
-        + f"\n{objective} alg={args.alg} σ={args.sigma} λ={pop} k={args.k} batch={args.batch}"
+        + f"\nobj={objective} alg={args.alg} σ={args.sigma} λ={pop} k={args.k} batch={args.batch}"
     )
 
     log = PandasLogger(s)
 
-    def process_audio(row) -> np.ndarray:
+    def process_audio(row, to_sr: int = 16000) -> np.ndarray:
         if "array" in row:
             au, sr = row["array"], row["sampling_rate"]
         else:
             au, sr = lr.load(io.BytesIO(row["bytes"]))
-        return preprocess_wav(au, source_sr=sr)
+        return preprocess_wav(au, source_sr=sr, to_sr=to_sr)
 
-    date_string = datetime.now().strftime("%Y-%m-%d-%H:%M")
+    dt_started = datetime.now()
+    date_string = dt_started.strftime("%Y-%m-%d-%H:%M")
     exp_dir = f"{args.out_dir}/{date_string}" + (f"-{args.suffix}" if args.suffix is not None else "")
 
     os.makedirs(exp_dir, exist_ok=True)
-    logging.info(f"Experiment dir: {exp_dir}")
+    logging.info(f"experiment dir: {exp_dir}")
 
     def save_checkpoint(i):
         best = s.status["pop_best"].access_values(keep_evals=True).unsqueeze(0).to(tts.device)
@@ -235,7 +224,7 @@ def main():
 
         # for best quality, generate using non-batched forward()
         for j, span in enumerate(phonemes):
-            out = tts.forward(span, best[len(span) - 1], speed=1.0)
+            out = tts.forward(span, best[len(span) - 1], speed=1)
             sf.write(f"{exp_dir}/checkpoint-{i}-{j}.wav", out, 24000)
 
         torch.save(best, f"{exp_dir}/checkpoint-{i}.pt")
@@ -244,13 +233,12 @@ def main():
 
     for epoch in itertools.count(0):
         for batch in dataloader:
-            # compute the L2 normed mean embedding of everything in batch["audio"]
-            audio = [torch.from_numpy(process_audio(row)).float().to(args.d) for row in batch["audio"]]
-            target_embed_all = venc.embed(audio)
-            mean = torch.sum(target_embed_all, dim=0) / target_embed_all.shape[0]
+            ref_wavs_ = [
+                torch.from_numpy(process_audio(row, to_sr=24000)).float().to(args.d) for row in batch["audio"]
+            ]
+            ref_wavs = pad_sequence(ref_wavs_, batch_first=True)
+            ref_lens = torch.tensor([ref.shape[0] for ref in ref_wavs_]).to(args.d)
 
-            # NOTE: these are accessed by loss() (in s.step()) and save_checkpoint() (kinda jank but it works)
-            target_embed = mean / torch.linalg.vector_norm(mean)
             phonemes = batch["phonemes"]
 
             # perform K steps over the same minibatch before swapping to a new one
@@ -259,7 +247,7 @@ def main():
 
                 if i % args.save_every == 0:
                     logging.info(
-                        f"saving checkpoint: ep={epoch:02} it={i:05} ∧={s.status['best_eval']:.4e} λ∧={s.status['pop_best_eval']:.4e} μ={s.status['mean_eval']:.4e}"
+                        f"ep={epoch} it={i:04} ∧={s.status['best_eval']:.3e} λ∧={s.status['pop_best_eval']:.3e} μ={s.status['mean_eval']:.4e} t+{str(datetime.now() - dt_started)}"
                     )
                     save_checkpoint(i)
                     log.to_dataframe().plot(title=title)
