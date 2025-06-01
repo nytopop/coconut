@@ -21,8 +21,8 @@ from misaki import en, espeak
 from torch.nn.utils.rnn import pad_sequence
 from transformers import MimiModel
 
-from audio_embed import preprocess_wav
-from loss import mimi_loss, spectral_loss
+from audio_embed import VoiceEncoder, preprocess_wav
+from loss import mimi_loss, resemblyzer_loss, spectral_loss
 
 logging.basicConfig(level=logging.INFO)
 
@@ -69,6 +69,9 @@ def main():
 
     # mimi for calculating perceptual loss
     mimi = MimiModel.from_pretrained("kyutai/mimi").to(args.d)
+
+    # resemblyzer speaker encoding model
+    venc = VoiceEncoder(device=args.d)
 
     # configure & load kokoro
     try:
@@ -176,7 +179,10 @@ def main():
             syn_wavs, syn_lens = tts.forward_batch(styles, phonemes * n, speed=1)
 
             pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
-            loss = pool + temp
+
+            resm = 1e-2 * resemblyzer_loss(venc, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+
+            loss = pool + temp + resm
 
             if args.spectral:
                 loss += spectral_loss(ref_wavs, syn_wavs, n)

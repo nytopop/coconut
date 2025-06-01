@@ -30,10 +30,10 @@ Fit `ex02` `default` with an interpolation of all initial voices + bias term:
 ```shell
 $ uv run train.py --dataset expresso-conv --speaker ex02 --style default --interp voices --bias
 ...
-INFO:root:ep=1 it=0150 ∧=4.615e-03 λ∧=4.710e-03 μ=4.7593e-03 t+0:05:15.193748
+INFO:root:ep=3 it=0475 ∧=5.307e-03 λ∧=7.726e-03 μ=7.8508e-03 t+0:17:12.159811
 ```
 
-[At 150 steps](samples/default-150.wav)
+[At 475 steps](samples/default-475.wav)
 
 ![Train plot](samples/default-train.png)
 

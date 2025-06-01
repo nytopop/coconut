@@ -1,8 +1,38 @@
 from typing import Tuple
 
+import librosa
+import numpy as np
+import scipy
 import torch
 import torch.nn.functional as F
+from torchaudio.functional import resample
 from transformers import MimiModel
+
+from audio_embed import VoiceEncoder
+
+
+def resemblyzer_loss(
+    venc: VoiceEncoder,
+    ref_wavs: torch.Tensor,  # [B, Tr]
+    ref_lens: torch.Tensor,  # [B]
+    syn_wavs: torch.Tensor,  # [B x N, Ts]
+    syn_lens: torch.Tensor,  # [B x N]
+    n: int,
+) -> torch.Tensor:  # [N]
+    # assumes 24khz inputs that have already been preprocessed
+    ref_wavs = resample(ref_wavs, orig_freq=24000, new_freq=16000)
+    ref_wavs = [ref_wavs[i, : int(ref_lens[i] // 1.5)] for i in range(0, ref_wavs.shape[0])]
+    ref_embd = venc.embed(ref_wavs)  # [B, 256]
+
+    syn_wavs = resample(syn_wavs, orig_freq=24000, new_freq=16000)
+    syn_wavs = [syn_wavs[i, : int(syn_lens[i] // 1.5)] for i in range(0, syn_wavs.shape[0])]
+    syn_embd = venc.embed(syn_wavs)  # [B x N, 256]
+
+    mse = (ref_embd.repeat(n, 1) - syn_embd).pow(2).mean(dim=1)  # [B x N]
+
+    bmse = mse.reshape(n, -1).mean(dim=1)  # [N]
+
+    return bmse
 
 
 def mimi_loss(
