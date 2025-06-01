@@ -48,7 +48,7 @@ def main():
 
     hb = parser.add_argument_group("batching")
     hb.add_argument("--chunk", type=int, default=24, metavar="N", help="concurrency (min = batch)" + d)
-    hb.add_argument("--batch", type=int, default=8, metavar="N", help="regularization minibatch size" + d)
+    hb.add_argument("--batch", type=int, default=4, metavar="N", help="regularization minibatch size" + d)
     hb.add_argument("--k", type=int, default=4, metavar="N", help="iterations per minibatch" + d)
 
     hd = parser.add_argument_group("dataset")
@@ -58,7 +58,7 @@ def main():
     hd.add_argument("--no-stream", default=False, action="store_true", help="download dataset" + d)
 
     ho = parser.add_argument_group("objectives (choose one)")
-    ho.add_argument("--interp", metavar="DIR", help="fit a linear combination of all voices in DIR")
+    ho.add_argument("--interp", metavar="PATH", help="fit a linear combination of all voices in PATH")
     ho.add_argument("--bias", default=False, action="store_true", help="fit a free bias term" + d)
     args = parser.parse_args()
 
@@ -130,7 +130,10 @@ def main():
 
     # configure objective function
     if args.interp:
-        pack = [torch.load(f"{args.interp}/{p}", map_location=args.d) for p in os.listdir(args.interp)]
+        try:
+            pack = [torch.load(f"{args.interp}/{p}", map_location=args.d) for p in os.listdir(args.interp)]
+        except NotADirectoryError:
+            pack = [torch.load(f"{args.interp}", map_location=args.d)]
         n, pack = len(pack), torch.stack(pack)  # => [N, 510, 1, 256]
     else:
         n = 0
@@ -245,7 +248,7 @@ def main():
             for i in itertools.islice(iters, args.k):
                 s.step()
 
-                if i % args.save_every == 0:
+                if i == 0 or i % args.save_every == 0:
                     logging.info(
                         f"ep={epoch} it={i:04} ∧={s.status['best_eval']:.3e} λ∧={s.status['pop_best_eval']:.3e} μ={s.status['mean_eval']:.4e} t+{str(datetime.now() - dt_started)}"
                     )
