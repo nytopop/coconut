@@ -131,7 +131,7 @@ def spectral_loss(
     # 2. Repeat reference audio to match the synthetic batch dimension structure
     # ref_audio_trimmed is [B_ref, T_common]
     # We want [B_ref * n, T_common] to match syn_audio_trimmed
-    ref_audio_repeated = ref_audio_trimmed.repeat(n_candidate_variations, dim=0)
+    ref_audio_repeated = ref_audio_trimmed.repeat(n_candidate_variations, 1)
     # Now ref_audio_repeated is [B_ref * n, T_common]
     # And syn_audio_trimmed is [B_ref * n, T_common]
 
