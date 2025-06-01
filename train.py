@@ -19,6 +19,7 @@ from evotorch.logging import PandasLogger
 from kokoro import KModel
 from misaki import en, espeak
 from torch.nn.utils.rnn import pad_sequence
+from torchaudio.functional import highpass_biquad, lowpass_biquad
 from transformers import MimiModel
 
 from audio_embed import VoiceEncoder, preprocess_wav
@@ -252,6 +253,7 @@ def main():
                 torch.from_numpy(process_audio(row, to_sr=24000)).float().to(args.d) for row in batch["audio"]
             ]
             ref_wavs = pad_sequence(ref_wavs_, batch_first=True)
+            ref_wavs = highpass_biquad(ref_wavs, 24000, 90)
             ref_lens = torch.tensor([ref.shape[0] for ref in ref_wavs_]).to(args.d)
 
             phonemes = batch["phonemes"]
