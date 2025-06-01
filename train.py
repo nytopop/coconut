@@ -34,7 +34,7 @@ def main():
     parser = argparse.ArgumentParser(description=desc)
     parser.add_argument("--out-dir", default="out", metavar="DIR", help="output directory" + d)
     parser.add_argument("--suffix", help="suffix to append to output path" + d)
-    parser.add_argument("--save-every", type=int, default=10, metavar="N", help="save every N iterations" + d)
+    parser.add_argument("--save-every", type=int, default=25, metavar="N", help="save every N iterations" + d)
     parser.add_argument("--seed", type=int, default=42, help="RNG seed" + d)
     parser.add_argument("-t", default="fp16", choices=["fp32", "fp16", "bf16"], help=d)
     parser.add_argument("-d", default="cuda", choices=["cpu", "cuda"], help=d)
@@ -49,10 +49,10 @@ def main():
     hb = parser.add_argument_group("batching")
     hb.add_argument("--chunk", type=int, default=24, metavar="N", help="concurrency (min = batch)" + d)
     hb.add_argument("--batch", type=int, default=4, metavar="N", help="regularization minibatch size" + d)
-    hb.add_argument("--k", type=int, default=4, metavar="N", help="iterations per minibatch" + d)
+    hb.add_argument("--k", type=int, default=25, metavar="N", help="iterations per minibatch" + d)
 
     hd = parser.add_argument_group("dataset")
-    hd.add_argument("--dataset", choices=["expresso", "animevox", "genshin"], required=True)
+    hd.add_argument("--dataset", choices=["expresso", "expresso-conv", "animevox", "genshin"], required=True)
     hd.add_argument("--speaker", required=True, help=d)
     hd.add_argument("--style", help=d)
     hd.add_argument("--no-stream", default=False, action="store_true", help="download dataset" + d)
@@ -94,6 +94,13 @@ def main():
 
     match args.dataset:
         case "expresso":
+            ds = load_dataset("ylacombe/expresso", split="train", streaming=streaming)
+            ds = ds.rename_columns({"text": "transcription", "speaker_id": "speaker"})
+            if args.style is not None:
+                ds = ds.filter(lambda r: row_filter(r) and r["style"] == args.style)
+            else:
+                ds = ds.filter(row_filter)
+        case "expresso-conv":
             ds = load_dataset("nytopop/expresso-conversational", split="train", streaming=streaming)
             ds = ds.rename_columns({"text": "transcription", "speaker_id": "speaker"})
             if args.style is not None:
@@ -101,7 +108,7 @@ def main():
             else:
                 ds = ds.filter(row_filter)
         case _ if args.style:
-            parser.error("--style is only valid for the expresso dataset")
+            parser.error("--style is only valid for expresso and expresso-conv datasets")
         case "animevox":
             ds = load_dataset("taresh18/AnimeVox", split="train", streaming=streaming)
             ds = ds.rename_columns({"character_name": "speaker"})
@@ -124,7 +131,7 @@ def main():
         num_workers=4,
         collate_fn=lambda rows: {
             "audio": [row["audio"] for row in rows],
-            "phonemes": [g2p(row["transcription"])[0][:508] for row in rows],
+            "phonemes": [g2p(row["transcription"].replace("*", ""))[0][:508] for row in rows],
         },
     )
 
@@ -248,7 +255,7 @@ def main():
             for i in itertools.islice(iters, args.k):
                 s.step()
 
-                if i == 0 or i % args.save_every == 0:
+                if i == 1 or i % args.save_every == 0:
                     logging.info(
                         f"ep={epoch} it={i:04} ∧={s.status['best_eval']:.3e} λ∧={s.status['pop_best_eval']:.3e} μ={s.status['mean_eval']:.4e} t+{str(datetime.now() - dt_started)}"
                     )
