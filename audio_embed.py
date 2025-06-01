@@ -202,7 +202,9 @@ class VoiceEncoder(nn.Module):
         return norm
 
 
-def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray], source_sr: Optional[int] = None):
+def preprocess_wav(
+    fpath_or_wav: Union[str, Path, np.ndarray], to_sr: int = sampling_rate, source_sr: Optional[int] = None
+):
     """
     Applies preprocessing operations to a waveform either on disk or in memory such that
     The waveform will be resampled to match the data hyperparameters.
@@ -222,7 +224,7 @@ def preprocess_wav(fpath_or_wav: Union[str, Path, np.ndarray], source_sr: Option
 
     # Resample the wav
     if source_sr is not None:
-        wav = lr.resample(wav, orig_sr=source_sr, target_sr=sampling_rate)
+        wav = lr.resample(wav, orig_sr=source_sr, target_sr=to_sr)
 
     # Apply the preprocessing: normalize volume and shorten long silences
     wav = normalize_volume(wav, audio_norm_target_dBFS, increase_only=True)
