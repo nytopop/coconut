@@ -36,7 +36,6 @@ def main():
     parser.add_argument("--suffix", help="suffix to append to output path" + d)
     parser.add_argument("--save-every", type=int, default=25, metavar="N", help="save every N iterations" + d)
     parser.add_argument("--seed", type=int, default=42, help="RNG seed" + d)
-    parser.add_argument("-t", default="fp16", choices=["fp32", "fp16", "bf16"], help=d)
     parser.add_argument("-d", default="cuda", choices=["cpu", "cuda"], help=d)
 
     ha = parser.add_argument_group("optimization algorithm")
@@ -79,17 +78,8 @@ def main():
     except Exception:
         fallback = None
 
-    g2p = en.G2P(trf=True, british=False, fallback=fallback, unk="")
-
-    match args.t:
-        case "fp16":
-            ty, cx = torch.float16, True
-        case "bf16":
-            ty, cx = torch.bfloat16, False
-        case "fp32":
-            ty, cx = torch.float32, False
-
-    tts = KModel(repo_id="hexgrad/Kokoro-82M", disable_complex=cx).to(dtype=ty, device=args.d)
+    g2p = en.G2P(trf=False, british=False, fallback=fallback, unk="")
+    tts = KModel(repo_id="hexgrad/Kokoro-82M").to(device=args.d)
 
     # configure & load dataset
     streaming = not args.no_stream
@@ -176,11 +166,16 @@ def main():
 
             styles = styles.repeat_interleave(len(phonemes), 0)  # => [C, 510, 1, 256]
 
-            syn_wavs, syn_lens = tts.forward_batch(styles, phonemes * n, speed=1)
+            with torch.autocast(tts.device.type):
+                syn_wavs, syn_lens = tts.forward_batch(styles, phonemes * n, speed=1)
 
-            pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+                pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
 
-            resm = 1e-2 * resemblyzer_loss(venc, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+                resm = 1e-2 * resemblyzer_loss(venc, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+
+            if args.interp:
+                # TODO: add a regularization term of distance to nearest in pack
+                pass
 
             loss = pool + temp + resm
 
