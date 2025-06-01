@@ -19,11 +19,7 @@ dependencies = [
     "webrtcvad",
     "setuptools<=80.0.0", # pinned due to deprecation of pkg_resources @ 81+
     "scipy",
-    # TODO: can prob remove these parkokoro deps as we're using the other batched impl
-    "huggingface_hub",
     "transformers",
-    "loguru",
-    "attrs",
 ]
 
 [dependency-groups]
