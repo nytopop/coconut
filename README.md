@@ -49,7 +49,7 @@ uv run train.py --help
 - [taresh18/AnimeVox](https://huggingface.co/datasets/taresh18/AnimeVox)
 - [simon3000/genshin-voice](https://huggingface.co/datasets/simon3000/genshin-voice)
 
-It's fairly straightforward to adapt to your own dataset: ensure an `audio` and `transcription` column are present. Examples of munging the above datasets into that format are available in [`train.py`](train.py), which is mostly as simple as:
+It's fairly straightforward to adapt to your own dataset: ensure `audio`, `transcription`, and `speaker` columns are present. Examples of munging the above datasets into that format are available in [`train.py`](train.py), which is mostly as simple as:
 
 ```python
 ds = load_dataset("taresh18/AnimeVox", split="train", streaming=streaming)
