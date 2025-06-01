@@ -58,7 +58,7 @@ def main():
     hd.add_argument("--no-stream", default=False, action="store_true", help="download dataset" + d)
 
     ho = parser.add_argument_group("objectives (choose one)")
-    ho.add_argument("--interp", metavar="PATH", help="fit a linear combination of all voices in PATH")
+    ho.add_argument("--interp", metavar="PATH", help="fit a linear combination of any voices at PATH")
     ho.add_argument("--bias", default=False, action="store_true", help="fit a free bias term" + d)
     args = parser.parse_args()
 
