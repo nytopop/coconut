@@ -35,7 +35,7 @@ INFO:root:ep=3 it=0475 ∧=5.307e-03 λ∧=7.726e-03 μ=7.8508e-03 t+0:17:12.159
 
 [At 475 steps](samples/default-475.wav)
 
-![Train plot](samples/default-train.png)
+![Train plot](samples/default.png)
 
 See `--help` for more options:
 
