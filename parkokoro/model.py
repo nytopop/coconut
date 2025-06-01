@@ -100,7 +100,7 @@ class KModel(torch.nn.Module):
         input_lengths: torch.LongTensor, # B
         speed: float,
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
-        ref_s = styles[torch.arange(styles.shape[0]), input_lengths, :, :]
+        ref_s = styles[torch.arange(styles.shape[0]), input_lengths-1, :, :]
         s = ref_s[:, :, 128:] # b x 1 x sty_dim
     
         max_len = input_ids.shape[1]
