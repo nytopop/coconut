@@ -33,9 +33,7 @@ $ uv run train.py --dataset expresso-conv --speaker ex02 --style default --inter
 INFO:root:ep=3 it=0475 ∧=5.307e-03 λ∧=7.726e-03 μ=7.8508e-03 t+0:17:12.159811
 ```
 
-[At 475 steps](samples/default-475.wav)
-
-[At 475 steps](samples/default-475.webm)
+[default-475.webm](https://github.com/user-attachments/assets/97f28a04-50f5-4085-88ac-73bd8bbc491c)
 
 ![Train plot](samples/default.png)
 
