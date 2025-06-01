@@ -1,26 +1,8 @@
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
 from transformers import MimiModel
-
-
-def joint_mimi_spectral_loss(
-    mimi: MimiModel,
-    ref_wavs_: List[torch.Tensor],  # [B, ~T]
-    syn_wavs: torch.Tensor,  # [B x N, T]
-    syn_lens: torch.Tensor,  # [B x N]
-    n: int,
-) -> torch.Tensor:  # [N]
-    ref_wavs = pad_sequence(ref_wavs_, batch_first=True)
-    ref_lens = torch.tensor([ref.shape[0] for ref in ref_wavs_]).to(ref_wavs.device)
-
-    pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
-
-    spec = 1e-5 * spectral_loss(ref_wavs, syn_wavs, n)
-
-    return pool + temp + spec
 
 
 def mimi_loss(
@@ -169,4 +151,4 @@ def spectral_loss(
     # We want to group by n_candidate_variations and average over B_ref
     final_loss = loss_per_sample.view(n_candidate_variations, -1).mean(dim=1)
 
-    return final_loss
+    return 1e-5 * final_loss
