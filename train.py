@@ -40,16 +40,18 @@ def main():
     parser.add_argument("-d", default="cuda", choices=["cpu", "cuda"], help=d)
 
     ha = parser.add_argument_group("optimization algorithm")
-    ha.add_argument("--alg", default="snes", choices=["xnes", "snes", "cmaes", "cem"], help=d)
+    ha.add_argument("--alg", default="cmaes", choices=["xnes", "snes", "cmaes", "cem"], help=d)
     ha.add_argument("--sigma", type=float, default=0.01, metavar="σ", help="initial step size" + d)
     ha.add_argument("--pop", type=int, metavar="λ", help="population size [auto]")
     ha.add_argument("--rho", type=float, default=0.1, metavar="ρ", help="parenthood ratio (CEM only)" + d)
+    ha.add_argument("--spectral", default=False, action="store_true", help="add spectral loss term" + d)
+
     # TODO: config the optimizer of xnes & snes (we can use momentum based adam/clipup)
 
     hb = parser.add_argument_group("batching")
     hb.add_argument("--chunk", type=int, default=24, metavar="N", help="concurrency (min = batch)" + d)
     hb.add_argument("--batch", type=int, default=4, metavar="N", help="regularization minibatch size" + d)
-    hb.add_argument("--k", type=int, default=25, metavar="N", help="iterations per minibatch" + d)
+    hb.add_argument("--k", type=int, default=1, metavar="N", help="iterations per minibatch" + d)
 
     hd = parser.add_argument_group("dataset")
     hd.add_argument("--dataset", choices=["expresso", "expresso-conv", "animevox", "genshin"], required=True)
@@ -57,7 +59,7 @@ def main():
     hd.add_argument("--style", help=d)
     hd.add_argument("--no-stream", default=False, action="store_true", help="download dataset" + d)
 
-    ho = parser.add_argument_group("objectives (choose one)")
+    ho = parser.add_argument_group("objectives")
     ho.add_argument("--interp", metavar="PATH", help="fit a linear combination of any voices at PATH")
     ho.add_argument("--bias", default=False, action="store_true", help="fit a free bias term" + d)
     args = parser.parse_args()
@@ -174,8 +176,10 @@ def main():
             syn_wavs, syn_lens = tts.forward_batch(styles, phonemes * n, speed=1)
 
             pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
-            spec = spectral_loss(ref_wavs, syn_wavs, n)
-            loss = pool + temp + spec
+            loss = pool + temp
+
+            if args.spectral:
+                loss += spectral_loss(ref_wavs, syn_wavs, n)
 
             pop_loss.append(1e2 * loss)
 
