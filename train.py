@@ -39,33 +39,34 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="RNG seed" + d)
     parser.add_argument("-d", default="cuda", choices=["cpu", "cuda"], help=d)
 
-    ha = parser.add_argument_group("optimization algorithm")
+    ha = parser.add_argument_group("optimizer")
     ha.add_argument("--alg", default="cmaes", choices=["xnes", "snes", "cmaes", "cem"], help=d)
     ha.add_argument("--sigma", type=float, default=0.01, metavar="σ", help="initial step size" + d)
-    ha.add_argument("--pop", type=int, metavar="λ", help="population size [auto]")
     ha.add_argument("--rho", type=float, default=0.1, metavar="ρ", help="parenthood ratio (CEM only)" + d)
     ha.add_argument("--spectral", default=False, action="store_true", help="add spectral loss term" + d)
-
-    # TODO: config the optimizer of xnes & snes (we can use momentum based adam/clipup)
-
-    hb = parser.add_argument_group("batching")
-    hb.add_argument("--chunk", type=int, default=24, metavar="N", help="concurrency (min = batch)" + d)
-    hb.add_argument("--batch", type=int, default=4, metavar="N", help="regularization minibatch size" + d)
-    hb.add_argument("--k", type=int, default=1, metavar="N", help="iterations per minibatch" + d)
+    ha.add_argument("--batch", type=int, default=24, metavar="B", help="batch size" + d)
+    ha.add_argument("--pop", type=int, default=16, metavar="λ", help="population size (candidates/iter)" + d)
+    ha.add_argument("--window", type=int, default=6, metavar="W", help="window size (examples/iter)" + d)
+    ha.add_argument("--stride", type=int, metavar="S", help="sliding window stride [W/2]")
 
     hd = parser.add_argument_group("dataset")
     hd.add_argument("--dataset", choices=["expresso", "expresso-conv", "animevox", "genshin"], required=True)
     hd.add_argument("--speaker", required=True, help=d)
     hd.add_argument("--style", help=d)
     hd.add_argument("--no-stream", default=False, action="store_true", help="download dataset" + d)
+    hd.add_argument("--epochs", type=int, help="epoch limit" + d)
 
     ho = parser.add_argument_group("objectives")
-    ho.add_argument("--interp", metavar="PATH", help="fit a linear combination of any voices at PATH")
+    ho.add_argument("--interp", metavar="PATH", help="fit a linear combination of voice(s) at PATH")
     ho.add_argument("--bias", default=False, action="store_true", help="fit a free bias term" + d)
+
     args = parser.parse_args()
 
     if args.interp is None and not args.bias:
         parser.error("at least one objective is required: --interp, --bias")
+
+    if args.stride is not None and args.stride > args.window:
+        parser.error(f"stride {args.stride} > window {args.window} size; this is probably not what you want")
 
     # mimi for calculating perceptual loss
     mimi = MimiModel.from_pretrained("kyutai/mimi").to(args.d)
@@ -80,7 +81,7 @@ def main():
         fallback = None
 
     g2p = en.G2P(trf=False, british=False, fallback=fallback, unk="")
-    tts = KModel(repo_id="hexgrad/Kokoro-82M").to(device=args.d)
+    tts = KModel(repo_id="hexgrad/Kokoro-82M", disable_complex=True).to(device=args.d)
 
     # configure & load dataset
     streaming = not args.no_stream
@@ -121,9 +122,11 @@ def main():
     if not streaming:
         ds = ds.shuffle(seed=args.seed)
 
+    stride = max(1, int(args.window // 2) if args.stride is None else args.stride)
+
     dataloader = torch.utils.data.DataLoader(
         ds,
-        batch_size=args.batch,
+        batch_size=stride,
         num_workers=4,
         collate_fn=lambda rows: {
             "audio": [row["audio"] for row in rows],
@@ -160,12 +163,12 @@ def main():
     def loss(pop: torch.Tensor) -> torch.Tensor:
         pop_loss = []
         styles = i2v(pop.to(tts.device))  # => [P, 510, 1, 256]
-        N = max(1, args.chunk // len(phonemes))  # max candidates per forward pass
+        N = max(1, args.batch // len(phonemes))  # max candidates per forward pass
 
         for styles in [styles[i : i + N] for i in range(0, styles.shape[0], N)]:
             n = styles.shape[0]
 
-            styles = styles.repeat_interleave(len(phonemes), 0)  # => [C, 510, 1, 256]
+            styles = styles.repeat_interleave(len(phonemes), 0)  # => [n, 510, 1, 256]
 
             with torch.autocast(tts.device.type):
                 syn_wavs, syn_lens = tts.forward_batch(styles, phonemes * n, speed=1)
@@ -177,7 +180,7 @@ def main():
             loss = pool + temp + resm
 
             if args.interp:
-                # TODO: add a regularization term of distance to nearest in pack
+                # TODO: add a regularization term of distance to pack (for avoiding OOD outputs)
                 pass
 
             if args.spectral:
@@ -215,7 +218,7 @@ def main():
     title = (
         f"dataset={args.dataset} speaker={args.speaker}"
         + (f" style={args.style}" if args.style else "")
-        + f"\nobj={objective} alg={args.alg} σ={args.sigma} λ={pop} k={args.k} batch={args.batch}"
+        + f"\nobj={objective} alg={args.alg} σ={args.sigma} λ={pop} w={args.window} s={stride}"
     )
 
     log = PandasLogger(s)
@@ -245,24 +248,41 @@ def main():
 
         torch.save(best, f"{exp_dir}/checkpoint-{i}.pt")
 
-    iters = itertools.count(1)
+    b_aud = []
+    phonemes = []
+    i = 1
 
     for epoch in itertools.count(0):
         for batch in dataloader:
+            b_aud.extend(batch["audio"])
+            b_aud = b_aud[-args.window :]
+
             ref_wavs_ = [
-                torch.from_numpy(process_audio(row, to_sr=24000)).float().to(args.d) for row in batch["audio"]
+                torch.from_numpy(process_audio(row, to_sr=24000)).float().to(args.d) for row in b_aud
             ]
             ref_wavs = pad_sequence(ref_wavs_, batch_first=True)
             ref_wavs = highpass_biquad(ref_wavs, 24000, 90)
             ref_lens = torch.tensor([ref.shape[0] for ref in ref_wavs_]).to(args.d)
 
-            phonemes = batch["phonemes"]
+            phonemes.extend(batch["phonemes"])
+            phonemes = phonemes[-args.window :]
 
-            # perform K steps over the same minibatch before swapping to a new one
-            for i in itertools.islice(iters, args.k):
-                s.step()
+            s.step()
 
-                if i == 1 or i % args.save_every == 0:
+            if i == 1 or i % args.save_every == 0:
+                logging.info(
+                    f"ep={epoch} it={i:04} ∧={s.status['best_eval']:.3e} λ∧={s.status['pop_best_eval']:.3e} μ={s.status['mean_eval']:.4e} t+{str(datetime.now() - dt_started)}"
+                )
+                save_checkpoint(i)
+                log.to_dataframe().plot(title=title)
+                plt.savefig(f"{exp_dir}/train.png")
+                plt.close()
+
+            i += 1
+
+        if args.epochs is not None:
+            if (epoch + 1) >= args.epochs:
+                if (i - 1) % args.save_every != 0:
                     logging.info(
                         f"ep={epoch} it={i:04} ∧={s.status['best_eval']:.3e} λ∧={s.status['pop_best_eval']:.3e} μ={s.status['mean_eval']:.4e} t+{str(datetime.now() - dt_started)}"
                     )
@@ -270,6 +290,7 @@ def main():
                     log.to_dataframe().plot(title=title)
                     plt.savefig(f"{exp_dir}/train.png")
                     plt.close()
+                break
 
 
 if __name__ == "__main__":
