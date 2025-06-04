@@ -1,8 +1,5 @@
 from typing import Tuple
 
-import librosa
-import numpy as np
-import scipy
 import torch
 import torch.nn.functional as F
 from torchaudio.functional import resample
@@ -181,4 +178,4 @@ def spectral_loss(
     # We want to group by n_candidate_variations and average over B_ref
     final_loss = loss_per_sample.reshape(n_candidate_variations, -1).mean(dim=1)
 
-    return 1e-5 * final_loss
+    return final_loss

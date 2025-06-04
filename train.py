@@ -13,7 +13,7 @@ import soundfile as sf
 import torch
 from datasets import load_dataset
 from evotorch import Problem
-from evotorch.algorithms import CEM, CMAES, SNES, XNES
+from evotorch.algorithms import CEM, CMAES, SNES, XNES, Cosyne
 from evotorch.decorators import vectorized
 from evotorch.logging import PandasLogger
 from kokoro import KModel
@@ -40,14 +40,14 @@ def main():
     parser.add_argument("-d", default="cuda", choices=["cpu", "cuda"], help=d)
 
     ha = parser.add_argument_group("optimizer")
-    ha.add_argument("--alg", default="cmaes", choices=["xnes", "snes", "cmaes", "cem"], help=d)
+    ha.add_argument("--alg", default="cmaes", choices=["xnes", "snes", "cmaes", "cem", "cosyne"], help=d)
     ha.add_argument("--sigma", type=float, default=0.01, metavar="σ", help="initial step size" + d)
     ha.add_argument("--rho", type=float, default=0.1, metavar="ρ", help="parenthood ratio (CEM only)" + d)
-    ha.add_argument("--spectral", default=False, action="store_true", help="add spectral loss term" + d)
-    ha.add_argument("--batch", type=int, default=24, metavar="B", help="batch size" + d)
-    ha.add_argument("--pop", type=int, default=16, metavar="λ", help="population size (candidates/iter)" + d)
-    ha.add_argument("--window", type=int, default=6, metavar="W", help="window size (examples/iter)" + d)
+    ha.add_argument("--pop", type=int, default=24, metavar="λ", help="population size (candidates/iter)" + d)
+    ha.add_argument("--window", type=int, default=4, metavar="W", help="window size (examples/iter)" + d)
     ha.add_argument("--stride", type=int, metavar="S", help="sliding window stride [W/2]")
+    ha.add_argument("--batch", type=int, default=24, metavar="B", help="batch size" + d)
+    ha.add_argument("--spectral", default=False, action="store_true", help="add spectral loss term" + d)
 
     hd = parser.add_argument_group("dataset")
     hd.add_argument("--dataset", choices=["expresso", "expresso-conv", "animevox", "genshin"], required=True)
@@ -140,14 +140,14 @@ def main():
             pack = [torch.load(f"{args.interp}/{p}", map_location=args.d) for p in os.listdir(args.interp)]
         except NotADirectoryError:
             pack = [torch.load(f"{args.interp}", map_location=args.d)]
-        n, pack = len(pack), torch.stack(pack)  # => [N, 510, 1, 256]
+        n, pack = len(pack), torch.stack(pack)  # => [V, 510, 1, 256]
     else:
         n = 0
 
     init = torch.zeros(n + 256 if args.bias else n)
 
     def i2v(pop: torch.Tensor) -> torch.Tensor:
-        scaled = biased = 0
+        scaled = biased = bias_q = 0
 
         if args.interp:
             weight = torch.softmax(pop[:, :n][..., None, None, None], dim=1)
@@ -155,18 +155,21 @@ def main():
 
         # TODO: interpolate the final bias from a stack of equidistant buckets
         if args.bias:
+            bias_q = pop[:, n:].pow(2).mean(dim=1)
             biased = pop[:, n:][:, None, None, :].expand(-1, 510, -1, -1)
 
-        return scaled + biased
+        return scaled + biased, bias_q
+
+    i = 1
 
     @vectorized
     def loss(pop: torch.Tensor) -> torch.Tensor:
         pop_loss = []
-        styles = i2v(pop.to(tts.device))  # => [P, 510, 1, 256]
+        styles, bias_q = i2v(pop.to(tts.device))  # => [P, 510, 1, 256], [P]
         N = max(1, args.batch // len(phonemes))  # max candidates per forward pass
 
         for styles in [styles[i : i + N] for i in range(0, styles.shape[0], N)]:
-            n = styles.shape[0]
+            n, _, _, _ = styles.shape
 
             styles = styles.repeat_interleave(len(phonemes), 0)  # => [n, 510, 1, 256]
 
@@ -175,22 +178,21 @@ def main():
 
             pool, temp = mimi_loss(mimi, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
 
-            resm = 1e-2 * resemblyzer_loss(venc, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
+            loss = pool + temp
 
-            loss = pool + temp + resm
-
-            if args.interp:
-                # TODO: add a regularization term of distance to pack (for avoiding OOD outputs)
-                pass
+            loss += 1e-2 * resemblyzer_loss(venc, ref_wavs, ref_lens, syn_wavs, syn_lens, n)
 
             if args.spectral:
-                loss += spectral_loss(ref_wavs, syn_wavs, n)
+                loss += 1e-5 * spectral_loss(ref_wavs, syn_wavs, n)
 
-            pop_loss.append(1e2 * loss)
+            pop_loss.append(loss)
 
         pop_loss = torch.cat(pop_loss)
 
-        return torch.nan_to_num(pop_loss, nan=math.inf)
+        if args.interp and args.bias and pack.shape[0] > 1:
+            pop_loss += 3e-5 * bias_q
+
+        return 1e2 * torch.nan_to_num(pop_loss, nan=math.inf)
 
     # configure optimizer & search algorithm (TODO: could do device=args.d, but do we need to? uses vram)
     p = Problem(
@@ -208,6 +210,12 @@ def main():
             if args.pop is None:
                 args.pop = 4 + 3 * math.log(n)
             s = CEM(p, stdev_init=args.sigma, popsize=args.pop, parenthood_ratio=args.rho, center_init=init)
+        case "cosyne":
+            if args.pop is None:
+                args.pop = 4 + 3 * math.log(n)
+            s = Cosyne(
+                p, popsize=args.pop, tournament_size=4, mutation_stdev=args.sigma, elitism_ratio=args.rho
+            )
 
     pop = getattr(s, "_popsize", None)
     if pop is None:
@@ -239,7 +247,7 @@ def main():
 
     def save_checkpoint(i):
         best = s.status["pop_best"].access_values(keep_evals=True).unsqueeze(0).to(tts.device)
-        best = i2v(best).squeeze(0)
+        best = i2v(best)[0].squeeze(0)
 
         # for best quality, generate using non-batched forward()
         for j, span in enumerate(phonemes):
@@ -250,22 +258,21 @@ def main():
 
     b_aud = []
     phonemes = []
-    i = 1
 
     for epoch in itertools.count(0):
         for batch in dataloader:
-            b_aud.extend(batch["audio"])
-            b_aud = b_aud[-args.window :]
+            for au, ph in zip([process_audio(au, to_sr=24000) for au in batch["audio"]], batch["phonemes"]):
+                if len(au) > 0:
+                    b_aud.append(au)
+                    phonemes.append(ph)
 
-            ref_wavs_ = [
-                torch.from_numpy(process_audio(row, to_sr=24000)).float().to(args.d) for row in b_aud
-            ]
+            b_aud = b_aud[-args.window :]
+            phonemes = phonemes[-args.window :]
+
+            ref_wavs_ = [torch.from_numpy(au).float().to(args.d) for au in b_aud]
             ref_wavs = pad_sequence(ref_wavs_, batch_first=True)
             ref_wavs = highpass_biquad(ref_wavs, 24000, 90)
             ref_lens = torch.tensor([ref.shape[0] for ref in ref_wavs_]).to(args.d)
-
-            phonemes.extend(batch["phonemes"])
-            phonemes = phonemes[-args.window :]
 
             s.step()
 
