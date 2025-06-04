@@ -13,7 +13,7 @@ dependencies = [
     "librosa",
     "soundfile",
     "misaki[en]",
-    "kokoro @ git+https://github.com/nytopop/kokoro.git@batching",
+    "kokoro @ git+https://github.com/nytopop/kokoro.git@batching2",
     "pip",
     "datasets",
     "webrtcvad",
